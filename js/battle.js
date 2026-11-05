@@ -9,7 +9,7 @@ import {
 } from './state.js';
 import { drawUnitSprite, drawPortrait } from './sprites.js';
 import { $, esc, toast, statusLabel, statusKind, openModal } from './ui.js';
-import { sfx } from './audio.js';
+import { sfx, isMuted, toggleMute } from './audio.js';
 
 const DIRS = [{ x: 0, y: -1, f: 'n' }, { x: 1, y: 0, f: 'e' }, { x: 0, y: 1, f: 's' }, { x: -1, y: 0, f: 'w' }];
 const OPPOSITE = { n: 's', s: 'n', e: 'w', w: 'e' };
@@ -504,7 +504,10 @@ export function startBattle({ state, encounter, onEnd }) {
   function renderTurnOrder() {
     const el = $('#turn-order');
     if (!el) return;
-    const order = forecastOrder(9);
+    const forecast = forecastOrder(9);
+    const order = B.active && !B.active.dead
+      ? [B.active, ...forecast.filter(u => u.uid !== B.active.uid)].slice(0, 9)
+      : forecast;
     el.innerHTML = order.map((u, i) => `
       <div class="turn-chip ${u.side === 'enemy' ? 'enemy' : ''} ${B.active && u.uid === B.active.uid && i === 0 ? 'active' : ''}">
         <span class="tc-dot"></span>
@@ -647,6 +650,7 @@ export function startBattle({ state, encounter, onEnd }) {
   }
 
   function refresh() {
+    B._sideUid = null;
     renderHeader();
     renderTurnOrder();
     renderSideInfo();
@@ -980,7 +984,845 @@ export function startBattle({ state, encounter, onEnd }) {
     if (B.destroyed) return;
     B.busy = false;
     if (B.over) { refresh(); return; }
-    if (caster.dead) { endTurn(); return; }
+    if (caster.dead) { endTurn(caster.uid); return; }
     caster.hasActed = true;
-    endTurn();
+    endTurn(caster.uid);
   }
+
+  /* ============================================================
+     TURN FLOW, STATUS TICKS AND BATTLE RESOLUTION
+     ============================================================ */
+  function tickTurnStatuses(u) {
+    const max = u.stats.maxHp;
+    for (const s of [...u.statuses]) {
+      if (u.dead) return;
+      if (s.id === 'poison' || s.id === 'burn') {
+        const dmg = Math.max(1, Math.round(max * (s.value || 0.06)));
+        u.hp = Math.max(0, u.hp - dmg);
+        const p = unitPoint(u);
+        floater(p.x, p.y - 30, `-${dmg}`, s.id === 'burn' ? '#e08a5a' : '#8fae7a');
+        log(`<strong>${esc(u.name)}</strong> suffers ${dmg} ${s.id === 'burn' ? 'burn' : 'poison'} damage.`, 'system');
+        if (u.hp <= 0) { killUnit(u, null); return; }
+      }
+      if (s.id === 'regen') {
+        healUnit(u, Math.max(1, Math.round(max * (s.value || 0.08))));
+      }
+    }
+    for (const s of [...u.statuses]) {
+      s.turns = (s.turns || 1) - 1;
+      if (s.turns <= 0 || (s.id === 'shield' && (s.value || 0) <= 0)) {
+        u.statuses = u.statuses.filter(x => x !== s);
+      }
+    }
+  }
+
+  function finishBattle(victory) {
+    if (B.over) return;
+    B.over = true;
+    B.mode = 'over';
+    B.busy = false;
+    B.active = null;
+    clearTargets();
+    refresh();
+    log(victory ? 'The field is ours.' : 'The company falls.', victory ? 'gold' : 'enemy');
+    sfx(victory ? 'victory' : 'defeat');
+    const payload = {
+      victory,
+      loot: B.loot.slice(),
+      stolenGold: B.stolenGold,
+      kills: B.kills,
+      turns: Math.max(1, B.turnCount),
+      usedItems: { ...B.usedItems },
+      survivors: living('player').map(u => u.name),
+    };
+    B._finishTimer = setTimeout(() => {
+      if (B.destroyed) return;
+      B.destroyed = true;
+      cancelAnimationFrame(B.raf);
+      detach();
+      if (B.onEnd) B.onEnd(payload);
+    }, 1100);
+  }
+
+  function checkEnd() {
+    if (B.over) return true;
+    if (!living('enemy').length) { finishBattle(true); return true; }
+    if (!living('player').length) { finishBattle(false); return true; }
+    return false;
+  }
+
+  function endTurn(expectedUid = null) {
+    if (B.destroyed || B.over) return;
+    if (expectedUid && B.active && B.active.uid !== expectedUid) return;
+    if (B.ending) return;
+    B.ending = true;
+    B.busy = false;
+    if (B.active) B.active.hasActed = true;
+    B.active = null;
+    B.mode = 'idle';
+    clearTargets();
+    refresh();
+    setTimeout(() => {
+      if (B.destroyed || B.over) return;
+      B.ending = false;
+      beginNextTurn();
+    }, 280);
+  }
+
+  function beginNextTurn() {
+    if (B.destroyed || B.over) return;
+    B.ending = false;
+    if (checkEnd()) return;
+
+    let guard = 0;
+    while (!B.units.some(u => !u.dead && u.ct >= 100) && guard++ < 2000) {
+      for (const u of B.units) if (!u.dead) u.ct += ctGain(u);
+      B.turnCount += 1;
+    }
+    const ready = B.units
+      .filter(u => !u.dead && u.ct >= 100)
+      .sort((a, b) => b.ct - a.ct || eff(b, 'spd') - eff(a, 'spd'));
+    if (!ready.length) return;
+
+    const u = ready[0];
+    u.ct -= 100;
+    B.active = u;
+    u.hasMoved = false;
+    u.hasActed = false;
+    const stunned = has(u, 'stun');
+    tickTurnStatuses(u);
+    if (u.dead) return;
+    if (checkEnd()) return;
+
+    banner(u.name, u.side === 'enemy');
+    log(`<strong>${esc(u.name)}</strong> takes the field.`, u.side === 'player' ? 'player' : 'enemy');
+    sfx(u.side === 'player' ? 'turn' : 'enemyTurn');
+
+    if (stunned) {
+      log(`<strong>${esc(u.name)}</strong> is stunned and loses the turn.`, 'system');
+      toast(`${u.name} is stunned`);
+      B.mode = 'idle';
+      refresh();
+      setTimeout(() => {
+        if (B.destroyed || B.over) return;
+        B.ending = false;
+        endTurn(u.uid);
+      }, 700);
+      return;
+    }
+
+    if (u.side === 'player') {
+      B.mode = 'select';
+      const reach = computeReachable(u);
+      B.moveSet = reach.set;
+      B.movePaths = reach.paths;
+      B.busy = false;
+      refresh();
+    } else {
+      B.mode = 'enemy';
+      B.busy = true;
+      refresh();
+      setTimeout(() => {
+        if (!B.destroyed && !B.over && !u.dead) enemyTurn(u);
+      }, 620);
+    }
+  }
+
+  /* ============================================================
+     ARTS, ITEMS AND SUMMONS
+     ============================================================ */
+  function applyStatusList(target, statuses) {
+    if (!target || target.dead || !statuses) return;
+    for (const s of statuses) addStatus(target, s);
+  }
+
+  function findEmptyNear(center, radius, count = 1) {
+    const spots = [];
+    for (const t of B.tiles) {
+      if (spots.length >= count) break;
+      if (t.block || unitAt(t.x, t.y)) continue;
+      if (dist(center, t) > radius) continue;
+      spots.push(t);
+    }
+    return spots;
+  }
+
+  function summonThrall(spec, tile) {
+    const stats = {
+      maxHp: spec.hp, maxMp: 0, pa: spec.pa, ma: spec.ma, def: spec.def,
+      res: spec.res, spd: spec.spd, move: spec.move, jump: spec.jump,
+      luck: 5, weapon: { ...spec.weapon },
+    };
+    const u = {
+      uid: `s${UID++}`, side: 'player', name: spec.name, job: spec.job, level: spec.level || 1,
+      stats, hp: stats.maxHp, mp: 0, x: tile.x, y: tile.y, ct: 20 + stats.spd,
+      facing: 'n', statuses: [], dead: false, hasMoved: false, hasActed: false,
+      arts: (spec.abilities || []).map(getArt).filter(Boolean), source: null,
+      boss: false, dropId: null, xp: 0, isSummon: true, color: spec.color,
+    };
+    B.units.push(u);
+    const p = unitPoint(u);
+    burst(p.x, p.y - 12, spec.color || '#8c8478', 16);
+    log(`<strong>${esc(spec.name)}</strong> rises to serve.`, 'player');
+    return u;
+  }
+
+  async function executeArt(caster, art, target, itemCtx = null) {
+    if (!art || B.destroyed || !caster || caster.dead) return;
+    const isItem = !!itemCtx;
+    const kind = isItem ? art.kind : art.kind;
+    const center = target;
+    const targetUnit = target && target.uid ? target : null;
+    if (targetUnit) caster.facing = facingDir(caster, targetUnit);
+    else if (center) caster.facing = facingDir(caster, center);
+
+    if (isItem) {
+      B.usedItems[itemCtx.id] = (B.usedItems[itemCtx.id] || 0) + 1;
+      log(`<strong>${esc(caster.name)}</strong> uses <strong>${esc(itemCtx.name)}</strong>.`, 'player');
+    }
+
+    const aoe = art.aoe || 0;
+    const inArea = (u) => (targetUnit && u.uid === targetUnit.uid) || (center && dist(u, center) <= aoe);
+    const passes = (u) => {
+      if (!art.affect) return true;
+      if (art.affect === 'allies') return u.side === caster.side;
+      if (art.affect === 'enemies') return u.side !== caster.side;
+      return true;
+    };
+
+    /* --- summons --- */
+    if (kind === 'summon') {
+      const spots = findEmptyNear(center || caster, Math.max(1, aoe + 1), art.summonCount || 1);
+      if (!spots.length) {
+        toast('No room for the dead to rise');
+        log('The dead find no room to rise.', 'system');
+      } else {
+        for (const t of spots) summonThrall(art.summon, t);
+        sfx('magic');
+        shake(3);
+      }
+      await wait(360);
+      return;
+    }
+
+    /* --- revival --- */
+    if (kind === 'revive') {
+      const fallen = (targetUnit && targetUnit.dead && targetUnit.side === caster.side)
+        ? [targetUnit]
+        : B.units.filter(u => u.dead && u.side === caster.side && inArea(u));
+      if (!fallen.length) {
+        toast('No fallen ally there');
+      }
+      for (const ally of fallen) {
+        ally.dead = false;
+        const pct = art.power > 1 ? art.power / 100 : (art.power || 0.5);
+        ally.hp = Math.max(1, Math.round(ally.stats.maxHp * pct));
+        ally.ct = 40 + eff(ally, 'spd');
+        ally.statuses = [];
+        const p = unitPoint(ally);
+        floater(p.x, p.y - 30, `+${ally.hp}`, '#8fc09a');
+        burst(p.x, p.y - 14, '#d6b56a', 20);
+        log(`<strong>${esc(ally.name)}</strong> returns to the field.`, 'gold');
+      }
+      sfx('heal');
+      await wait(360);
+      return;
+    }
+
+    /* --- healing --- */
+    if (kind === 'heal') {
+      const targets = B.units.filter(u => !u.dead && passes(u) && inArea(u));
+      if (!targets.length) toast('No ally in reach');
+      for (const ally of targets) {
+        const amount = isItem ? (art.power || 0) : healPower(caster, art);
+        healUnit(ally, amount);
+        if (art.cleanse) cleanse(ally);
+        applyStatusList(ally, art.statuses);
+        log(`<strong>${esc(caster.name)}</strong> restores <strong>${esc(ally.name)}</strong>.`, 'player');
+      }
+      if (!isItem) sfx('heal');
+      await wait(340);
+      return;
+    }
+
+    /* --- MP restoration --- */
+    if (kind === 'mp') {
+      const targets = B.units.filter(u => !u.dead && passes(u) && inArea(u));
+      for (const ally of targets) {
+        const before = ally.mp;
+        ally.mp = Math.min(ally.stats.maxMp, ally.mp + (art.power || 0));
+        const p = unitPoint(ally);
+        floater(p.x, p.y - 30, `+${ally.mp - before} MP`, '#7d9fd0');
+      }
+      sfx('heal');
+      await wait(320);
+      return;
+    }
+
+    /* --- cleanse / support --- */
+    if (kind === 'cleanse' || kind === 'support') {
+      const targets = B.units.filter(u => !u.dead && passes(u) && inArea(u));
+      for (const ally of targets) {
+        cleanse(ally);
+        applyStatusList(ally, art.statuses);
+        const p = unitPoint(ally);
+        floater(p.x, p.y - 30, 'CLEANSED', '#79c0b4');
+      }
+      if (!targets.length) toast('No ally in reach');
+      sfx('buff');
+      await wait(320);
+      return;
+    }
+
+    /* --- pure buffs / debuffs --- */
+    if (kind === 'buff' || kind === 'debuff') {
+      const targets = B.units.filter(u => !u.dead && passes(u) && inArea(u));
+      if (!targets.length) toast('No target in reach');
+      if (art.selfDamage) {
+        const selfDmg = Math.max(1, Math.round(caster.stats.maxHp * art.selfDamage));
+        caster.hp = Math.max(1, caster.hp - selfDmg);
+        const p = unitPoint(caster);
+        floater(p.x, p.y - 30, `-${selfDmg}`, '#b05257');
+        log(`<strong>${esc(caster.name)}</strong> pays ${selfDmg} HP in blood.`, 'system');
+      }
+      for (const t of targets) {
+        applyStatusList(t, art.statuses);
+        const p = unitPoint(t);
+        floater(p.x, p.y - 30, kind === 'buff' ? 'BLESSED' : 'CURSED', kind === 'buff' ? '#79c0b4' : '#b05257');
+        if (art.cleanse) cleanse(t);
+        log(`<strong>${esc(caster.name)}</strong> ${kind === 'buff' ? 'blesses' : 'curses'} <strong>${esc(t.name)}</strong>.`, kind === 'buff' ? 'player' : 'enemy');
+      }
+      sfx(kind === 'buff' ? 'buff' : 'debuff');
+      await wait(360);
+      return;
+    }
+
+    /* --- offensive / steal --- */
+    const targets = B.units.filter(u => !u.dead && passes(u) && inArea(u));
+    if (!targets.length) {
+      toast('Nothing in the blast');
+      await wait(180);
+      return;
+    }
+    if (kind === 'mag') sfx('magic');
+    else sfx('hit');
+    let totalDamage = 0;
+
+    for (const foe of targets) {
+      if (foe.dead) continue;
+      const hit = isItem ? 100 : hitChance(caster, foe);
+      if (Math.random() * 100 > hit) {
+        const p = unitPoint(foe);
+        floater(p.x, p.y - 30, 'MISS', '#a2947c');
+        log(`<strong>${esc(caster.name)}</strong> misses <strong>${esc(foe.name)}</strong>.`, 'system');
+        continue;
+      }
+      let raw;
+      if (isItem && kind === 'damage') {
+        raw = (art.power || 0) - eff(foe, 'res') * 0.25;
+      } else if (isItem) {
+        raw = art.power || 0;
+      } else {
+        raw = estimateDamage(caster, foe, art);
+      }
+      const crit = !isItem && Math.random() * 100 < critChance(caster, art);
+      if (crit) raw *= 1.5;
+      const dealt = damageUnit(caster, foe, raw, art, { crit });
+      totalDamage += dealt;
+
+      if (art.steal) {
+        const [lo, hi] = art.steal;
+        const gold = Math.floor(lo + Math.random() * (hi - lo + 1));
+        B.stolenGold += gold;
+        const p = unitPoint(foe);
+        floater(p.x, p.y - 46, `+${gold}g`, '#f0d795');
+        log(`<strong>${esc(caster.name)}</strong> lifts ${gold} gold.`, 'gold');
+      }
+      if (!foe.dead) applyStatusList(foe, art.statuses);
+      if (art.drain && dealt > 0) {
+        healUnit(caster, Math.round(dealt * art.drain));
+      }
+    }
+
+    if (art.healAllies && totalDamage > 0) {
+      const allies = B.units.filter(u => !u.dead && u.side === caster.side && center && dist(u, center) <= aoe);
+      for (const ally of allies) healUnit(ally, Math.round(totalDamage * art.healAllies / Math.max(1, allies.length)));
+    }
+    if (kind === 'steal' && !totalDamage) {
+      const foe = targets[0];
+      if (foe && art.steal) {
+        const [lo, hi] = art.steal;
+        const gold = Math.floor(lo + Math.random() * (hi - lo + 1));
+        B.stolenGold += gold;
+        const p = unitPoint(foe);
+        floater(p.x, p.y - 30, `+${gold}g`, '#f0d795');
+        log(`<strong>${esc(caster.name)}</strong> lifts ${gold} gold from <strong>${esc(foe.name)}</strong>.`, 'gold');
+        sfx('loot');
+      }
+    }
+    shake(kind === 'mag' ? 2.2 : 3);
+    await wait(kind === 'mag' ? 380 : 300);
+  }
+
+  /* ============================================================
+     ENEMY AI
+     ============================================================ */
+  function bestHeal(u) {
+    const heals = u.arts.filter(a => a.kind === 'heal' && u.mp >= (a.mp || 0));
+    if (!heals.length) return null;
+    let best = null;
+    for (const art of heals) {
+      for (const ally of living('player')) {
+        const ratio = ally.hp / ally.stats.maxHp;
+        if (ratio > 0.72) continue;
+        if (dist(u, ally) > artRange(art, u)) continue;
+        const score = (1 - ratio) * 100 + (art.aoe || 0) * 4;
+        if (!best || score > best.score) best = { art, target: ally, score };
+      }
+    }
+    return best;
+  }
+
+  function bestOffense(u) {
+    const arts = [basicAttack(u), ...u.arts.filter(a =>
+      ['phys', 'mag', 'hybrid'].includes(a.kind) && u.mp >= (a.mp || 0))];
+    let best = null;
+    for (const foe of living('player')) {
+      for (const art of arts) {
+        if (dist(u, foe) > artRange(art, u)) continue;
+        const hit = hitChance(u, foe) / 100;
+        let score = estimateDamage(u, foe, art) * hit;
+        if (art.aoe) score *= 1 + Math.min(1.5, art.aoe * 0.35);
+        if (art.execute && foe.hp < foe.stats.maxHp * 0.5) score *= 1.3;
+        if (!best || score > best.score) best = { art, target: foe, score };
+      }
+    }
+    return best;
+  }
+
+  function bestDebuff(u) {
+    const arts = u.arts.filter(a => a.kind === 'debuff' && u.mp >= (a.mp || 0));
+    for (const art of arts) {
+      for (const foe of living('player')) {
+        if (dist(u, foe) <= artRange(art, u)) return { art, target: foe };
+      }
+    }
+    return null;
+  }
+
+  function bestBuff(u) {
+    const arts = u.arts.filter(a => a.kind === 'buff' && u.mp >= (a.mp || 0));
+    for (const art of arts) {
+      const hasBuff = (art.statuses || []).some(s => has(u, s.id));
+      if (!hasBuff) return { art, target: u };
+    }
+    return null;
+  }
+
+  function bestSummon(u) {
+    const art = u.arts.find(a => a.kind === 'summon' && u.mp >= (a.mp || 0));
+    if (!art) return null;
+    const activeSummons = B.units.filter(x => !x.dead && x.isSummon).length;
+    if (activeSummons >= 3) return null;
+    const spots = findEmptyNear(u, artRange(art, u), 1);
+    if (!spots.length) return null;
+    return { art, target: spots[0] };
+  }
+
+  function approachTile(u, target) {
+    const reach = computeReachable(u);
+    const attackArts = [basicAttack(u), ...u.arts.filter(a => ['phys', 'mag', 'hybrid', 'debuff'].includes(a.kind) && u.mp >= (a.mp || 0))];
+    let best = null;
+    for (const k of reach.set) {
+      const [x, y] = k.split(',').map(Number);
+      const t = tileAt(x, y);
+      if (!t) continue;
+      const occ = unitAt(x, y);
+      if (occ && occ.uid !== u.uid) continue;
+      if (x === u.x && y === u.y) continue;
+      const canHit = attackArts.some(a => dist({ x, y }, target) <= artRange(a, u));
+      const d = dist({ x, y }, target);
+      const score = (canHit ? -100 : 0) + d - (t.elev || 0) * 0.35;
+      if (!best || score < best.score) best = { score, path: reach.paths[k] };
+    }
+    return best;
+  }
+
+  async function enemyTurn(u) {
+    if (B.destroyed || B.over || u.dead) return;
+    B.busy = true;
+    B.mode = 'enemy';
+    refresh();
+    await wait(320);
+    if (B.destroyed || B.over || u.dead) return;
+
+    try {
+      const heal = bestHeal(u);
+      if (heal) {
+        await executeArt(u, heal.art, heal.target);
+        if (checkEnd()) return;
+        endTurn(u.uid);
+        return;
+      }
+
+      const summon = bestSummon(u);
+      if (summon && Math.random() < 0.65) {
+        await executeArt(u, summon.art, summon.target);
+        if (checkEnd()) return;
+        endTurn(u.uid);
+        return;
+      }
+
+      let attack = bestOffense(u);
+      if (!attack) {
+        const targets = living('player');
+        if (!targets.length) { endTurn(u.uid); return; }
+        const target = targets.sort((a, b) => dist(u, a) - dist(u, b) || a.hp - b.hp)[0];
+        const step = approachTile(u, target);
+        if (step && step.path && step.path.length > 1) {
+          await moveAlong(u, step.path);
+          if (B.destroyed) return;
+          await wait(120);
+        }
+        attack = bestOffense(u);
+      }
+
+      if (attack) {
+        await executeArt(u, attack.art, attack.target);
+        if (checkEnd()) return;
+        endTurn(u.uid);
+        return;
+      }
+
+      const debuff = bestDebuff(u);
+      if (debuff) {
+        await executeArt(u, debuff.art, debuff.target);
+        if (checkEnd()) return;
+        endTurn(u.uid);
+        return;
+      }
+
+      const buff = bestBuff(u);
+      if (buff && Math.random() < 0.7) {
+        await executeArt(u, buff.art, buff.target);
+        if (checkEnd()) return;
+        endTurn(u.uid);
+        return;
+      }
+    } catch (err) {
+      console.error('Enemy turn failed', err);
+    }
+    endTurn(u.uid);
+  }
+
+  /* ============================================================
+     PLAYER INPUT AND BUTTONS
+     ============================================================ */
+  const listeners = [];
+  function on(el, type, fn, opts) {
+    if (!el) return;
+    el.addEventListener(type, fn, opts);
+    listeners.push([el, type, fn, opts]);
+  }
+  function detach() {
+    for (const [el, type, fn, opts] of listeners) {
+      try { el.removeEventListener(type, fn, opts); } catch { /* ignore */ }
+    }
+    listeners.length = 0;
+  }
+
+  function backOneStep() {
+    if (B.busy || B.over) return;
+    sfx('cancel');
+    if (B.mode === 'target') {
+      clearTargets();
+      B.mode = B.active?.hasMoved ? 'action' : 'select';
+      if (!B.active?.hasMoved) {
+        const reach = computeReachable(B.active);
+        B.moveSet = reach.set;
+        B.movePaths = reach.paths;
+      }
+      refresh();
+      return;
+    }
+    if (B.mode === 'arts' || B.mode === 'items' || B.mode === 'move') {
+      clearTargets();
+      B.mode = B.active?.hasMoved ? 'action' : 'select';
+      if (!B.active?.hasMoved && B.active) {
+        const reach = computeReachable(B.active);
+        B.moveSet = reach.set;
+        B.movePaths = reach.paths;
+      }
+      refresh();
+      return;
+    }
+    if (B.mode === 'action') {
+      clearTargets();
+      B.mode = 'select';
+      if (B.active && !B.active.hasMoved) {
+        const reach = computeReachable(B.active);
+        B.moveSet = reach.set;
+        B.movePaths = reach.paths;
+      }
+      refresh();
+    }
+  }
+
+  function handleDock(act) {
+    const u = B.active;
+    if (!u || B.busy || B.over) return;
+    sfx('click');
+    if (act === 'move') {
+      if (u.hasMoved) { toast('Already moved'); return; }
+      const reach = computeReachable(u);
+      B.moveSet = reach.set;
+      B.movePaths = reach.paths;
+      B.mode = 'move';
+      refresh();
+      return;
+    }
+    if (act === 'openAction') {
+      B.mode = 'action';
+      B.moveSet = null;
+      B.movePaths = null;
+      refresh();
+      return;
+    }
+    if (act === 'wait') { endTurn(u.uid); return; }
+    if (act === 'attack') { beginTargeting('attack'); return; }
+    if (act === 'arts') { B.mode = 'arts'; clearTargets(); refresh(); return; }
+    if (act === 'items') { B.mode = 'items'; clearTargets(); refresh(); return; }
+    if (act === 'back') { backOneStep(); return; }
+    if (act === 'info') { showUnitInfo(B.hover || u); return; }
+    if (act.startsWith('art:')) {
+      const art = u.arts.find(a => a.id === act.slice(4));
+      if (!art) return;
+      if (u.mp < (art.mp || 0)) { toast('Not enough MP'); return; }
+      beginTargeting('art', art);
+      return;
+    }
+    if (act.startsWith('item:')) {
+      const id = act.slice(5);
+      const item = ITEM_MAP[id];
+      if (!item || !item.use) return;
+      beginTargeting('item', item);
+    }
+  }
+
+  function handleBoard(t) {
+    if (!t || B.busy || B.over || B.destroyed) return;
+    const u = unitAt(t.x, t.y);
+    const k = KEY(t.x, t.y);
+
+    if (B.mode === 'idle') {
+      if (u) showUnitInfo(u);
+      return;
+    }
+
+    if (B.mode === 'select' || B.mode === 'move') {
+      if (B.moveSet && B.moveSet.has(k)) {
+        startMove(t);
+        return;
+      }
+      if (u && u.side === 'player' && u.uid !== B.active?.uid) {
+        showUnitInfo(u);
+        return;
+      }
+      if (B.mode === 'move') backOneStep();
+      return;
+    }
+
+    if (B.mode === 'action') {
+      if (u && u.side === 'enemy') {
+        const range = basicAttack(B.active).range;
+        if (dist(B.active, u) <= range) {
+          beginTargeting('attack');
+          confirmTarget(t, u);
+        } else {
+          toast('Out of weapon range');
+          sfx('cancel');
+        }
+      }
+      return;
+    }
+
+    if (B.mode === 'target') {
+      confirmTarget(t, u);
+    }
+  }
+
+  function updatePointer(e) {
+    const t = pointerTile(e.clientX, e.clientY);
+    B.pointerTile = t;
+    B.mouse.x = e.clientX;
+    B.mouse.y = e.clientY;
+    const u = t ? unitAt(t.x, t.y) : null;
+    const changed = (u?.uid || null) !== (B.hover?.uid || null);
+    B.hover = u;
+    if (changed) {
+      B._sideUid = null;
+      renderSideInfo();
+    }
+    if (B.mode === 'target' && t && B.targeting) {
+      const art = B.targeting.art;
+      if ((art.aoe || 0) > 0) B.aoeSet = aoeSet(t, art.aoe);
+      if (u && u.side !== B.active?.side) showForecast(B.active, u, art);
+      else hideForecast();
+    }
+  }
+
+  function toggleThreat() {
+    B.threat = !B.threat;
+    if (!B.threat) {
+      B.threatSet = null;
+    } else {
+      const set = new Set();
+      for (const enemy of living('enemy')) {
+        const reach = computeReachable(enemy);
+        const range = Math.max(1, enemy.stats.weapon?.range || 1);
+        for (const k of reach.set) {
+          const [x, y] = k.split(',').map(Number);
+          for (const t of B.tiles) {
+            if (dist({ x, y }, t) <= range) set.add(KEY(t.x, t.y));
+          }
+        }
+      }
+      B.threatSet = set;
+    }
+    const btn = $('#btn-battle-threat');
+    if (btn) btn.textContent = B.threat ? 'Threat ●' : 'Threat';
+    toast(B.threat ? 'Enemy threat shown' : 'Enemy threat hidden');
+    sfx('click');
+  }
+
+  function showUnitInfo(u) {
+    if (!u) { toast('No unit selected'); return; }
+    const job = JOBS[u.job] || JOBS.squire;
+    const s = u.stats;
+    const statuses = u.statuses.length
+      ? u.statuses.map(st => `<span class="status-pip ${statusKind(st.id)}">${esc(statusLabel(st.id))}${st.turns ? ` ${st.turns}` : ''}</span>`).join(' ')
+      : '<span class="empty">No active conditions</span>';
+    const arts = (u.arts || []).map(a => `<div class="codex-entry"><h4>${esc(a.name)} <span style="color:var(--dim);font-size:10px">MP ${a.mp}</span></h4><p>${esc(a.desc)}</p></div>`).join('') || '<p class="empty">No Arts.</p>';
+    openModal({
+      title: `${u.name} — ${job.name}`,
+      body: `
+        <div class="unit-summary">
+          <canvas id="battle-info-portrait"></canvas>
+          <div>
+            <div class="us-name">${esc(u.name)}</div>
+            <div class="us-sub">${esc(job.role)} · Lv ${u.level} · ${u.side === 'player' ? 'Ashen Company' : 'Hostile'}</div>
+            <div class="us-stats">
+              <div class="us-stat"><span>HP</span><strong>${u.hp}/${s.maxHp}</strong></div>
+              <div class="us-stat"><span>MP</span><strong>${u.mp}/${s.maxMp}</strong></div>
+              <div class="us-stat"><span>PA</span><strong>${eff(u, 'pa')}</strong></div>
+              <div class="us-stat"><span>MA</span><strong>${eff(u, 'ma')}</strong></div>
+              <div class="us-stat"><span>DEF</span><strong>${eff(u, 'def')}</strong></div>
+              <div class="us-stat"><span>RES</span><strong>${eff(u, 'res')}</strong></div>
+              <div class="us-stat"><span>SPD</span><strong>${eff(u, 'spd')}</strong></div>
+              <div class="us-stat"><span>MOV</span><strong>${s.move}</strong></div>
+            </div>
+            <div class="si-status" style="margin-top:10px">${statuses}</div>
+            <p class="us-bio">${esc(job.blurb || '')}</p>
+          </div>
+        </div>
+        <div class="section-title">Arts</div>
+        <div class="art-list">${arts}</div>`,
+      onMount: (card) => {
+        const c = card.querySelector('#battle-info-portrait');
+        if (c) drawPortrait(c, u.job, u.side);
+      },
+    });
+  }
+
+  function showBattleCodex() {
+    const controls = `
+      <div class="codex-entry"><h4>Turn Order</h4><p>Every unit builds CT from Speed. At 100 CT it acts and resets. The strip at the top shows the coming turns.</p></div>
+      <div class="codex-entry"><h4>Movement & Height</h4><p>Teal tiles are reachable. High ground adds damage; attacking a foe from behind adds 20%. Jump lets you cross ledges.</p></div>
+      <div class="codex-entry"><h4>Actions</h4><p>Move, then Act. Attack with your weapon, spend MP on Arts, or use a supply. Wait ends the turn immediately.</p></div>
+      <div class="codex-entry"><h4>Conditions</h4><p>Poison and burn tick at the start of a turn. Stun skips the turn. Shields absorb damage before HP. Cleansing removes curses.</p></div>
+      <div class="codex-entry"><h4>Victory</h4><p>Rout every hostile. Downed companions return after the battle; supplies are only spent if you win.</p></div>`;
+    openModal({ title: 'Field Codex', body: controls });
+  }
+
+  /* ---- wire controls ---- */
+  const canvasPointer = (e) => {
+    if (e.pointerType === 'mouse') updatePointer(e);
+  };
+  on(canvas, 'pointermove', canvasPointer);
+  on(canvas, 'pointerleave', () => {
+    B.hover = null;
+    B.pointerTile = null;
+    B._sideUid = null;
+    hideForecast();
+    renderSideInfo();
+  });
+  let downPoint = null;
+  on(canvas, 'pointerdown', (e) => {
+    downPoint = { x: e.clientX, y: e.clientY };
+    if (e.pointerType !== 'mouse') updatePointer(e);
+  });
+  on(canvas, 'pointerup', (e) => {
+    const t = pointerTile(e.clientX, e.clientY);
+    if (downPoint) {
+      const moved = Math.hypot(e.clientX - downPoint.x, e.clientY - downPoint.y);
+      downPoint = null;
+      if (moved > 14) return;
+    }
+    updatePointer(e);
+    handleBoard(t);
+  });
+  on(canvas, 'contextmenu', (e) => e.preventDefault());
+
+  on($('#action-dock'), 'click', (e) => {
+    const btn = e.target.closest('[data-act]');
+    if (btn) handleDock(btn.dataset.act);
+  });
+  on($('#btn-battle-threat'), 'click', toggleThreat);
+  on($('#btn-battle-info'), 'click', () => { sfx('click'); showUnitInfo(B.hover || B.active); });
+  on($('#btn-battle-codex'), 'click', () => { sfx('click'); showBattleCodex(); });
+  on($('#btn-battle-sound'), 'click', () => {
+    const muted = toggleMute();
+    const btn = $('#btn-battle-sound');
+    if (btn) btn.textContent = muted ? 'Muted' : 'Sound';
+    toast(muted ? 'Sound muted' : 'Sound on');
+  });
+  const onKey = (e) => {
+    if (!document.getElementById('modal-root')?.classList.contains('hidden')) return;
+    if (e.key === 'Escape') {
+      if (B.mode === 'target' || B.mode === 'arts' || B.mode === 'items' || B.mode === 'move' || B.mode === 'action') {
+        e.preventDefault();
+        backOneStep();
+      }
+    }
+  };
+  on(window, 'keydown', onKey);
+  on(window, 'resize', resize);
+
+  /* ---- boot ---- */
+  const logList = $('#log-list');
+  if (logList) logList.innerHTML = '';
+  const soundBtn = $('#btn-battle-sound');
+  if (soundBtn) soundBtn.textContent = isMuted() ? 'Muted' : 'Sound';
+  B.turnCount = 0;
+  log(`<strong>${esc(encounter.title)}</strong> — ${esc(encounter.objective)}.`, 'system');
+  resize();
+  setTimeout(resize, 80);
+  B.raf = requestAnimationFrame(frame);
+  refresh();
+  setTimeout(() => {
+    if (!B.destroyed) beginNextTurn();
+  }, 450);
+
+  return {
+    destroy() {
+      if (B.destroyed) return;
+      B.destroyed = true;
+      cancelAnimationFrame(B.raf);
+      clearTimeout(B._finishTimer);
+      clearTimeout(B._bannerTimer);
+      detach();
+      hideForecast();
+    },
+    get battle() { return B; },
+  };
+}
